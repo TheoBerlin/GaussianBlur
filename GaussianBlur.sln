@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 15
+VisualStudioVersion = 15.0.28307.757
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "GaussianBlur", "GaussianBlur\GaussianBlur.vcxproj", "{8F53E757-448E-4FB6-8816-865F4EE73362}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{8F53E757-448E-4FB6-8816-865F4EE73362}.Debug|x64.ActiveCfg = Debug|x64
+		{8F53E757-448E-4FB6-8816-865F4EE73362}.Debug|x64.Build.0 = Debug|x64
+		{8F53E757-448E-4FB6-8816-865F4EE73362}.Release|x64.ActiveCfg = Release|x64
+		{8F53E757-448E-4FB6-8816-865F4EE73362}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {0165749A-F98D-4C29-BB48-B5D547FA5D05}
+	EndGlobalSection
+EndGlobal

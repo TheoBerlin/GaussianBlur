@@ -2,161 +2,89 @@
 #include "device_launch_parameters.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
 #include <time.h>
 #include <vector>
 
-#define MAX_MATRIX_WIDTH 4096
+#include "CImg.h"
 
-__constant__ int matrixWidth;
-__constant__ int diagonal;
+using namespace cimg_library;
 
-__global__ void gaussianEliminationKernel(float* matrix, float* vector)
+// Contains width and height of image
+__constant__ int2 imageDims;
+
+__global__ void AOStoSOAKernel(unsigned char* imageIn, unsigned char* imageOut)
 {
-    /*
-        Sidenote for making reading the code easier:
-        - Indexing the matrix is done using the formula: row*matrixWidth + column
-    */
-	int blockSize = blockDim.x;
-	int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
     int threadCount = blockDim.x * gridDim.x;
 
-    // Divide the matrix rows between blocks. The division can't always be done evenly, so some blocks will receive more or less rows than others.
-    // Amount of rows per forward or backwards substitution (for the entire kernel, not just this block)
-    int rowsToReduce = matrixWidth - 1;
+    int pixelCount = imageDims.x * imageDims.y;
 
-    // Amount of blocks that will receive one more row than others
-    int burdenedBlocks = rowsToReduce % gridDim.x;
+    for (int pixelIdx = tid; pixelIdx < pixelCount; pixelIdx += threadCount) {
+        // Red
+        imageOut[pixelIdx] = imageIn[pixelIdx * 3];
 
-    // Amount of rows distributed to less burdened blocks
-    int rowsPerBlock = rowsToReduce / gridDim.x;
+        // Green
+        imageOut[pixelIdx + pixelCount] = imageIn[pixelIdx * 3 + 1];
 
-    // Offset in rows from the current diagonal element's row
-    int forwardRowOffset = rowsPerBlock * blockIdx.x;
-
-    if (blockIdx.x < gridDim.x - burdenedBlocks) {
-        // This is not a burdened block
-        rowsToReduce = rowsPerBlock;
-    } else {
-        rowsToReduce = rowsPerBlock + 1;
-        forwardRowOffset += blockIdx.x - (gridDim.x - burdenedBlocks);
+        // Blue
+        imageOut[pixelIdx + pixelCount * 2] = imageIn[pixelIdx * 3 + 2];
     }
+}
 
-    int backRowOffset = forwardRowOffset + diagonal + 1 - matrixWidth;
+__global__ void gaussianBlurKernel(unsigned char* imageIn, unsigned char* imageOut, double* mask)
+{
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    int threadCount = blockDim.x * gridDim.x;
 
-    // Amount of rows to backwards substitute
-    int backSubRows = max(0, min(rowsToReduce, rowsToReduce - (matrixWidth - (diagonal + 1 + forwardRowOffset))));
+    int pixelCount = imageDims.x * imageDims.y;
 
-    // Amount of rows to forwards substitute
-    int forwardSubRows = rowsToReduce - backSubRows;
+    // Blur all channels
+    for (int pixelIdx = tid; pixelIdx < pixelCount; pixelIdx += threadCount) {
+        int yPos = pixelIdx / imageDims.x;
+        int xPos = pixelIdx - yPos * imageDims.x;
 
-    if (diagonal < matrixWidth) {
-        // Division step
-        float denominator = 1.0f / matrix[diagonal * matrixWidth + diagonal];
+        // Find borders in X and Y directions, in case the pixel is near the edge of the image
+        int xMin = max(0, xPos - 2);
+        int xMax = min(imageDims.x-1, xPos + 2);
 
-        // Calculate thread's index so that the first thread starts one row beneath the current diagonal element's row
-        int blockStartingRow = diagonal + 1 + forwardRowOffset;
-        // The block will handle all elements between blockFirstElement up until (but excluding) blockFinalElement
-		int blockFinalElement = (blockStartingRow + forwardSubRows) * matrixWidth;
-        int row = blockStartingRow + threadIdx.x;
+        int yMin = max(0, yPos - 2);
+        int yMax = min(imageDims.y-1, yPos + 2);
 
-        for (int idx = row * matrixWidth + diagonal; idx < blockFinalElement; idx += blockSize * matrixWidth) {
-            float rowMultFactor = matrix[idx] * denominator;
-            matrix[idx] = rowMultFactor;
+        int yLength = yMax - yMin + 1;
+        int xLength = xMax - xMin + 1;
 
-            // Reduce vector
-            vector[row] = vector[row] - rowMultFactor * vector[diagonal];
+        // Offset the mask index using the x and y borders
+        int maskOffsetX = (xMin - xPos + 2);
+        int maskOffsetY = (yMin - yPos + 2);
+        int maskStartIdx = 5 * maskOffsetY + maskOffsetX;
 
-            row += blockSize;
-        }
+        double red = 0.0, green = 0.0, blue = 0.0;
 
-        // Perform the same divisions for all rows above the diagonal element
-        blockStartingRow = diagonal - 1 - backRowOffset;
-        blockFinalElement = (row - backSubRows) * matrixWidth + matrixWidth;
-        row = blockStartingRow - threadIdx.x;
+        for (int yOffset = 0; yOffset < yLength; yOffset += 1) {
+            int imageIdxRed = (yMin + yOffset) * imageDims.x + xMin;
+            int maskIdx = maskStartIdx + 5 * yOffset;
 
-        for (int idx = row * matrixWidth + diagonal; idx > blockFinalElement; idx -= blockSize * matrixWidth) {
-            float rowMultFactor = matrix[idx] * denominator;
-            matrix[idx] = rowMultFactor;
-
-            vector[row] = vector[row] - rowMultFactor * vector[diagonal];
-
-            row -= blockSize;
-        }
-
-        // Every reduction factor for a block's rows needs to be stored before reduction can be performed
-        __syncthreads();
-
-        // Reduction step, row by row
-        // Amount of elements to reduce per row (-1 as the elements beneath the diagonal elements are 'manually' set to 0)
-        int elementsPerRow = matrixWidth - diagonal - 1;
-
-        // Pre-calculations for forward and backwards reduction
-        int threadRowOffset = tid / elementsPerRow;
-        int threadColumnOffset = tid - threadRowOffset * elementsPerRow;
-
-        // The base value for iterating through the matrix elements is to start at [row, column] = [diagonal+1, diagonal+1]
-        // Calculate an offset from this position based on the thread ID
-        if (forwardSubRows > 0) {
-            int blockStartingElement = (diagonal + 1 + forwardRowOffset) * matrixWidth + diagonal + 1;
-			blockFinalElement = blockStartingElement + matrixWidth * forwardSubRows;
-
-			int idx = blockStartingElement + threadRowOffset * matrixWidth + threadColumnOffset;
-            int elementNr = tid;
-
-            // Forward substitution (reducing rows downwards)
-            while (idx < blockFinalElement) {
-				// Current element - element in the diagonal element's row, above idx * row's multiplying factor stored in the current row (underneath the diagonal element)
-                matrix[idx] -= matrix[matrixWidth * diagonal + (diagonal + threadColumnOffset + 1)] * matrix[idx - threadColumnOffset - 1];
-
-                // Transform the index to dodge already reduced rows and columns to the left of the diagonal elmement
-                elementNr += threadCount;
-
-                threadRowOffset = elementNr / elementsPerRow;
-				threadColumnOffset = elementNr - threadRowOffset * elementsPerRow;
-
-				idx = blockStartingElement + threadRowOffset * matrixWidth + threadColumnOffset;
+            for (int xOffset = 0; xOffset < xLength; xOffset += 1) {
+                double maskValue = mask[maskIdx++];
+                red += imageIn[imageIdxRed] * maskValue;
+                green += imageIn[imageIdxRed + pixelCount] * maskValue;
+                blue += imageIn[imageIdxRed + pixelCount + pixelCount] * maskValue;
+                imageIdxRed += 1;
             }
         }
 
-        if (backSubRows > 0) {
-            // Backwards substitution (upwards reducing)
-			int blockStartingElement = backRowOffset * matrixWidth + diagonal + 1;
-			blockFinalElement = blockStartingElement + matrixWidth * backSubRows;
-
-			int idx = blockStartingElement + threadRowOffset * matrixWidth + threadColumnOffset;
-            int elementNr = tid;
-
-            while (idx < blockFinalElement) {
-				// Current element - element in the diagonal element's row, above idx * row's multiplying factor stored in the current row (underneath the diagonal element)
-                matrix[idx] -= matrix[matrixWidth * diagonal + (diagonal + threadColumnOffset + 1)] * matrix[idx - threadColumnOffset - 1];
-
-                // Transform the index to dodge already reduced rows and columns to the left of the diagonal elmement
-                elementNr += threadCount;
-
-                threadRowOffset = elementNr / elementsPerRow;
-				threadColumnOffset = elementNr - threadRowOffset * elementsPerRow;
-
-				idx = blockStartingElement + threadRowOffset * matrixWidth + threadColumnOffset;
-            }
-        }
-
-    } else {
-        // Normalize diagonal
-		tid = blockIdx.x * blockDim.x + threadIdx.x;
-		int threadCount = blockDim.x * gridDim.x;
-
-        for (int diagonalElement = tid; diagonalElement < matrixWidth; diagonalElement += threadCount) {
-            int diagIdx = diagonalElement * matrixWidth + diagonalElement;
-            float diagValue = matrix[diagIdx];
-
-            vector[diagonalElement] /= diagValue;
-        }
+        int outIdx = pixelIdx * 3;
+        imageOut[outIdx] = red;
+        imageOut[outIdx + 1] = green;
+        imageOut[outIdx + 2] = blue;
     }
 }
 
@@ -168,51 +96,49 @@ enum Program {
 struct Configuration {
     Program program;
     unsigned int threadCount;
-    unsigned int matrixWidth;
     bool quick;
 };
 
 void initConfig(Configuration& config, int argCount, char* argValues[]);
-void initMatrix(std::vector<float>& matrix, std::vector<float>& vector, unsigned int matrixWidth);
-void cpuGaussianEliminatation(std::vector<float>& matrix, const std::vector<float>& vector, std::vector<float>& solutionVec, unsigned int matrixWidth);
-cudaError_t cudaGaussianElimination(const std::vector<float>& matrix, const std::vector<float>& vector, std::vector<float>& solutionVec, const Configuration& config);
-void checkValidity(const std::vector<float>& matrix, const std::vector<float>& solutionVec, const std::vector<float>& rightHandVec, unsigned int matrixWidth);
-void printMatrix(const std::vector<float>& matrix, const std::vector<float>& vector, const std::string& fileName, unsigned int matrixWidth);
+void initMask(CImg<double>& mask, bool quick);
+cudaError_t cudaGaussianBlur(CImg<unsigned char>& image, const CImg<double>& mask, const Configuration& config);
 
 int main(int argCount, char* argValues[])
 {
     Configuration config;
     initConfig(config, argCount, argValues);
 
-    std::vector<float> matrix, vector, solutionVec;
-    initMatrix(matrix, vector, config.matrixWidth);
-    if (!config.quick) {
-        printMatrix(matrix, vector, "matrixIn", config.matrixWidth);
-    }
+    CImg<unsigned char> image("cake.ppm"), blurimage("cake.ppm");
+    CImg<double> mask;
+    initMask(mask, config.quick);
 
-    printf("Starting gaussian elimination\n");
+    printf("Starting blurring process\n");
     if (config.program == CPU) {
-        cpuGaussianEliminatation(matrix, vector, solutionVec, config.matrixWidth);
+        blurimage.convolve(mask);
     } else {
-        cudaError_t cudaStatus = cudaGaussianElimination(matrix, vector, solutionVec, config);
-        if (cudaStatus != cudaSuccess) {
-            return 1;
-        }
+        cudaGaussianBlur(blurimage, mask, config);
 
         // cudaDeviceReset must be called before exiting in order for profiling and
         // tracing tools such as Nsight and Visual Profiler to show complete traces.
-        cudaStatus = cudaDeviceReset();
+        cudaError_t cudaStatus = cudaDeviceReset();
         if (cudaStatus != cudaSuccess) {
             fprintf(stderr, "cudaDeviceReset failed: %s\n", cudaGetErrorString(cudaStatus));
             return 1;
         }
     }
-
-    printf("Finished gaussian elimination\n");
+    printf("Finished blurring process\n");
 
     if (!config.quick) {
-        checkValidity(matrix, solutionVec, vector, config.matrixWidth);
-        printMatrix(matrix, solutionVec, "matrixOut", config.matrixWidth);
+        // Display images and save the blurred version
+        CImgDisplay main_disp(image, "Original image");
+        CImgDisplay main_disp2(blurimage, "Blurred image");
+
+        const char* fileName = "blurred.ppm";
+        blurimage.save(fileName);
+        printf("Saved blurred image in file '%s'\n", fileName);
+
+        // Keep the displays open
+        std::getchar();
     }
 
     return 0;
@@ -221,9 +147,8 @@ int main(int argCount, char* argValues[])
 void initConfig(Configuration& config, int argCount, char* argValues[])
 {
     // Initialize default values
-    config.program = CUDA;
-    config.threadCount = 8192;
-    config.matrixWidth = 200;
+    config.program = CPU;
+    config.threadCount = 69632;
     config.quick = false;
 
     for (int argIdx = 1; argIdx < argCount; argIdx += 1) {
@@ -251,11 +176,6 @@ void initConfig(Configuration& config, int argCount, char* argValues[])
                 config.threadCount = std::stoi(argStr);
                 break;
 
-            case 'n':
-                argStr = std::string(argValues[++argIdx]);
-                config.matrixWidth = std::stoi(argStr);
-                break;
-
             // q for 'quick'
             case 'q':
                 config.quick = true;
@@ -268,81 +188,36 @@ void initConfig(Configuration& config, int argCount, char* argValues[])
     }
 }
 
-void initMatrix(std::vector<float>& matrix, std::vector<float>& vector, unsigned int matrixWidth)
+void initMask(CImg<double>& mask, bool quick)
 {
-    srand((unsigned int)time(NULL));
-    unsigned int matrixSize = matrixWidth * matrixWidth;
-    matrix.resize(matrixSize);
-    vector.resize(matrixWidth);
+	// Create the mask of weights (5 x 5 Gaussian blur)
+    mask = CImg<double>(5,5);
 
-    for (size_t row = 0; row < matrixWidth; row += 1) {
-        size_t rowStartIdx = row * matrixWidth;
+	mask(0, 0) = mask(0, 4) = mask(4, 0) = mask(4, 4) = 1.0 / 256.0;
+	mask(0, 1) = mask(0, 3) = mask(1, 0) = mask(1, 4) = mask(3, 0) = mask(3, 4) = mask(4, 1) = mask(4, 3) = 4.0 / 256.0;
+	mask(0, 2) = mask(2, 0) = mask(2, 4) = mask(4, 2) = 6.0 / 256.0;
+	mask(1, 1) = mask(1, 3) = mask(3, 1) = mask(3, 3) = 16.0 / 256.0;
+	mask(1, 2) = mask(2, 1) = mask(2, 3) = mask(3, 2) = 24.0 / 256.0;
+	mask(2, 2) = 36.0 / 256.0;
 
-        for (size_t col = 0; col < matrixWidth; col += 1) {
-            matrix[rowStartIdx + col] = (float)(rand() % 5) + 1.0f;
+    if (!quick) {
+        // Print the mask that is being used
+        printf("5x5 mask:\n");
 
-            // Make sure diagonal elements are larger than non-diagonal elements
-            if (row == col) {
-                matrix[rowStartIdx + col] += 5;
+        for (int i = 0; i <= 4; i++) {
+            for (int j = 0; j <= 4; j++) {
+                std::cout << mask(i, j) << " ";
             }
-        }
-    }
 
-    for (unsigned int i = 0; i < matrixWidth; i += 1) {
-        vector[i] = (float)(rand() % 3) + 1.0f;
+            std::cout << "\n";
+        }
     }
 }
 
-void cpuGaussianEliminatation(std::vector<float>& matrix, const std::vector<float>& vector, std::vector<float>& solutionVec, unsigned int matrixWidth)
+cudaError_t cudaGaussianBlur(CImg<unsigned char>& image, const CImg<double>& mask, const Configuration& config)
 {
-    solutionVec.resize(vector.size());
-    std::memcpy(&solutionVec.front(), &vector.front(), sizeof(float) * vector.size());
-
-    std::vector<float> matrixCpy;
-    matrixCpy.resize(matrix.size());
-    std::memcpy(&matrixCpy.front(), &matrix.front(), sizeof(float) * matrix.size());
-
-    for (size_t diagonal = 0; diagonal < matrixWidth; diagonal += 1) {
-        float diagonalReciprocal = 1.0f / matrixCpy[diagonal * matrixWidth + diagonal];
-
-        // Forward substitution
-        for (size_t subRow = diagonal + 1; subRow < matrixWidth; subRow += 1) {
-            size_t rowStartIdx = subRow * matrixWidth;
-            float multFactor = matrixCpy[rowStartIdx + diagonal] * diagonalReciprocal;
-
-            for (size_t subColumn = diagonal + 1; subColumn < matrixWidth; subColumn += 1) {
-                matrixCpy[rowStartIdx + subColumn] -= multFactor * matrixCpy[diagonal * matrixWidth + subColumn];
-            }
-
-            // Reduce right-hand vector
-            solutionVec[subRow] -= multFactor * solutionVec[diagonal];
-        }
-
-        // Backward substitution
-        for (int subRow = (int)diagonal - 1; subRow >= 0; subRow -= 1) {
-            size_t rowStartIdx = (size_t)subRow * matrixWidth;
-            float multFactor = matrixCpy[rowStartIdx + diagonal] * diagonalReciprocal;
-
-            for (size_t subColumn = diagonal+ 1; subColumn < matrixWidth; subColumn += 1) {
-                matrixCpy[rowStartIdx + subColumn] -= multFactor * matrixCpy[diagonal * matrixWidth + subColumn];
-            }
-
-            // Reduce right-hand vector
-            solutionVec[subRow] -= multFactor * solutionVec[diagonal];
-        }
-    }
-
-    // Normalize diagonal
-    for (size_t diagonal = 0; diagonal < matrixWidth; diagonal += 1) {
-        solutionVec[diagonal] /= matrixCpy[diagonal * matrixWidth + diagonal];
-    }
-
-    //matrix = matrixCpy;
-}
-
-cudaError_t cudaGaussianElimination(const std::vector<float>& matrix, const std::vector<float>& vector, std::vector<float>& solutionVec, const Configuration& config)
-{
-    float* deviceMatrix = nullptr, *deviceVector = nullptr;
+    unsigned char* deviceImageIn = nullptr, *deviceImageSOA = nullptr;
+    double* deviceMask = nullptr;
 
     cudaError_t cudaStatus = cudaSetDevice(0);
     if (cudaStatus != cudaSuccess) {
@@ -350,39 +225,32 @@ cudaError_t cudaGaussianElimination(const std::vector<float>& matrix, const std:
         goto Error;
     }
 
-    // Allocate GPU buffer for matrix.
-    cudaStatus = cudaMalloc((void**)&deviceMatrix, matrix.size() * sizeof(float));
+    // Allocate GPU buffer for input image.
+    cudaStatus = cudaMalloc((void**)&deviceImageIn, image.size() * sizeof(unsigned char));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed: %s\n", cudaGetErrorString(cudaStatus));
         goto Error;
     }
 
-    // Allocate GPU buffer for vector.
-    cudaStatus = cudaMalloc((void**)&deviceVector, vector.size() * sizeof(float));
+    // Allocate GPU buffer for restructued image.
+    cudaStatus = cudaMalloc((void**)&deviceImageSOA, image.size() * sizeof(unsigned char));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed: %s\n", cudaGetErrorString(cudaStatus));
         goto Error;
     }
 
-    // Send matrix width variable to GPU.
-    int mWidth = (int)config.matrixWidth;
-    cudaStatus = cudaMemcpyToSymbol(matrixWidth, (void*)&mWidth, sizeof(mWidth));
+    // Send image dimensions vector to GPU.
+    int2 imageDimensions[2] = {image.width(), image.height()};
+    cudaStatus = cudaMemcpyToSymbol(imageDims, (void*)imageDimensions, sizeof(int) * 2);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpyToSymbol failed: %s\n", cudaGetErrorString(cudaStatus));
         goto Error;
     }
 
-    // Copy matrix to GPU buffer.
-    cudaStatus = cudaMemcpy(deviceMatrix, &matrix.front(), matrix.size() * sizeof(float), cudaMemcpyHostToDevice);
+    // Copy image to GPU buffer.
+    cudaStatus = cudaMemcpy(deviceImageIn, image.data(), image.size() * sizeof(unsigned char), cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!\n");
-        goto Error;
-    }
-
-    // Copy vector to GPU buffer.
-    cudaStatus = cudaMemcpy(deviceVector, &vector.front(), vector.size() * sizeof(float), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!\n");
+        fprintf(stderr, "cudaMemcpy of image to device failed!\n");
         goto Error;
     }
 
@@ -401,63 +269,81 @@ cudaError_t cudaGaussianElimination(const std::vector<float>& matrix, const std:
     printf("Multiprocessors: %d\n", deviceProperties.multiProcessorCount);
     printf("Registries per block: %d\n", deviceProperties.regsPerBlock);
 
-    // Limit thread count if it exceeds the GPU's capacity
-    unsigned int maxThreads = deviceProperties.maxThreadsPerMultiProcessor * deviceProperties.multiProcessorCount;
-    unsigned int threadCount = std::min(maxThreads, config.threadCount);
-
     // Use the requested thread count to calculate the amount of blocks needed, and the amount of threads per block
-    unsigned int blockCount = 1 + (threadCount-1) / (unsigned int)deviceProperties.maxThreadsPerBlock;
+    unsigned int blockCount = 1 + (config.threadCount-1) / (unsigned int)deviceProperties.maxThreadsPerBlock;
 
     /*
         The requested amount of thread might not be evenly distributed into the blocks, eg. 7 threads can't be
         evenly divided among 3 blocks. Calculate the amount of threads to add to avoid this issue.
     */
-    unsigned int threadsToAdd = threadCount % blockCount;
-    unsigned int threadsPerBlock = (threadCount + threadsToAdd) / blockCount;
+    unsigned int threadsToAdd = config.threadCount % blockCount;
+    unsigned int threadsPerBlock = (config.threadCount + threadsToAdd) / blockCount;
 
-    printf("Blocks: %d, Threads: %d (added %d to the requested amount)\n", blockCount, threadCount + threadsToAdd, threadsToAdd);
+    printf("Blocks: %d, Threads: %d (added %d to the requested amount)\n", blockCount, config.threadCount + threadsToAdd, threadsToAdd);
 
     // Launch the kernel on the GPU.
     const dim3 gridDim = {blockCount, 1, 1};
     const dim3 blockDim = {threadsPerBlock, 1, 1};
 
-    for (int hDiagonal = 0; hDiagonal <= (int)config.matrixWidth; hDiagonal += 1) {
-        // Send matrix width variable to GPU.
-        cudaStatus = cudaMemcpyToSymbol(diagonal, (void*)&hDiagonal, sizeof(hDiagonal));
-        if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "cudaMemcpyToSymbol failed: %s\n", cudaGetErrorString(cudaStatus));
-            goto Error;
-        }
+    // Restructure the image from AOS to SOA
+    AOStoSOAKernel<<<gridDim, blockDim, 0>>>(deviceImageIn, deviceImageSOA);
 
-        gaussianEliminationKernel<<<gridDim, blockDim, 0>>>(deviceMatrix, deviceVector);
-
-        // Check for any errors launching the kernel
-        cudaStatus = cudaGetLastError();
-        if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-            goto Error;
-        }
-
-        // cudaDeviceSynchronize waits for the kernel to finish, and returns
-        // any errors encountered during the launch.
-        cudaStatus = cudaDeviceSynchronize();
-        if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel: %s\n", cudaStatus, cudaGetErrorString(cudaStatus));
-            goto Error;
-        }
+    // Check for any errors launching the kernel
+    cudaStatus = cudaGetLastError();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+        goto Error;
     }
 
-    // Copy output vector from GPU buffer to host memory.
-    solutionVec.resize(vector.size());
-
-    cudaStatus = cudaMemcpy(&solutionVec.front(), deviceVector, solutionVec.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    /* Prepare to blur the image */
+    // Allocate GPU buffer for mask.
+    cudaStatus = cudaMalloc((void**)&deviceMask, mask.size() * mask.size() * sizeof(double));
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed: %s\n", cudaGetErrorString(cudaStatus));
+        fprintf(stderr, "cudaMalloc failed: %s\n", cudaGetErrorString(cudaStatus));
+        goto Error;
+    }
+
+    // Copy mask to GPU buffer
+    cudaStatus = cudaMemcpy(deviceMask, mask.data(), mask.size() * sizeof(double), cudaMemcpyHostToDevice);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy of mask to device failed: %s\n", cudaGetErrorString(cudaStatus));
+        goto Error;
+    }
+
+    // Wait for AOS to SOA restructuring to finish
+    cudaStatus = cudaDeviceSynchronize();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel: %s\n", cudaStatus, cudaGetErrorString(cudaStatus));
+        goto Error;
+    }
+
+    // The buffer allocated for the initial input image can now be used for the blurred image
+    gaussianBlurKernel<<<gridDim, blockDim, 0>>>(deviceImageSOA, deviceImageIn, deviceMask);
+
+    // Check for any errors launching the kernel
+    cudaStatus = cudaGetLastError();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+        goto Error;
+    }
+
+    cudaStatus = cudaDeviceSynchronize();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel: %s\n", cudaStatus, cudaGetErrorString(cudaStatus));
+        goto Error;
+    }
+
+    // Copy output image from GPU buffer to host memory.
+    cudaStatus = cudaMemcpy(image.data(), deviceImageIn, image.size() * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy of blurred image to host failed: %s\n", cudaGetErrorString(cudaStatus));
         goto Error;
     }
 
 Error:
-    cudaFree(deviceMatrix);
+    cudaFree(deviceImageIn);
+    cudaFree(deviceImageSOA);
+    cudaFree(deviceMask);
 
     return cudaStatus;
 }

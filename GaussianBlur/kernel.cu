@@ -226,7 +226,7 @@ void loadPPM(const std::string& fileName, CImg<unsigned char>& image)
 
     image = CImg<unsigned char>(width, height, 1, 3);
 
-    // Ignore number/comment
+    // Ignore max number and line dedicated to comments
     file >> input;
     file.ignore();
 
@@ -234,8 +234,11 @@ void loadPPM(const std::string& fileName, CImg<unsigned char>& image)
     unsigned char* imageData = image.data();
     std::streamsize bytesPerRow = width * 3;
 
-    for (int i = 0; i < height * width * 3; i += 1) {
-        imageData[i] = file.get();
+    const std::streamsize chunkSize = 8192;
+
+    while (file) {
+        file.read((char*)imageData, chunkSize);
+        imageData += chunkSize;
     }
 
     file.close();

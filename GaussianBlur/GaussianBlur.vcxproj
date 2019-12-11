@@ -82,6 +82,10 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="CImg.h" />
+    <ClInclude Include="jpge.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="jpge.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

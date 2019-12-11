@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "CImg.h"
+#include "jpge.h"
 
 using namespace cimg_library;
 
@@ -100,6 +101,7 @@ struct Configuration {
 };
 
 void initConfig(Configuration& config, int argCount, char* argValues[]);
+void loadPPM(const std::string& fileName, CImg<unsigned char>& image);
 void initMask(CImg<double>& mask, bool quick);
 cudaError_t cudaGaussianBlur(CImg<unsigned char>& image, const CImg<double>& mask, const Configuration& config);
 
@@ -108,7 +110,7 @@ int main(int argCount, char* argValues[])
     Configuration config;
     initConfig(config, argCount, argValues);
 
-    CImg<unsigned char> image("cake.ppm"), blurimage("cake.ppm");
+    CImg<unsigned char> image("cake.ppm"), blurimage;
     CImg<double> mask;
     initMask(mask, config.quick);
 
@@ -116,6 +118,8 @@ int main(int argCount, char* argValues[])
     if (config.program == CPU) {
         blurimage.convolve(mask);
     } else {
+        loadPPM("cake.ppm", blurimage);
+
         cudaGaussianBlur(blurimage, mask, config);
 
         // cudaDeviceReset must be called before exiting in order for profiling and
@@ -131,11 +135,26 @@ int main(int argCount, char* argValues[])
     if (!config.quick) {
         // Display images and save the blurred version
         CImgDisplay main_disp(image, "Original image");
-        CImgDisplay main_disp2(blurimage, "Blurred image");
+        // The CUDA program converts the data layout format to RGBRGB, which CImg isn't meant to display
+        if (config.program == CPU) {
+            CImgDisplay main_disp2(blurimage, "Blurred image");
+        }
 
-        const char* fileName = "blurred.ppm";
-        blurimage.save(fileName);
-        printf("Saved blurred image in file '%s'\n", fileName);
+        // Save image to file
+        std::string fileName = "blurred.";
+
+        if (config.program == CPU) {
+            fileName.append("ppm");
+            blurimage.save(fileName.c_str());
+        } else {
+            fileName.append("jpeg");
+
+            if (!jpge::compress_image_to_jpeg_file(fileName.c_str(), blurimage.width(), blurimage.height(), blurimage.spectrum(), blurimage.data())) {
+                printf("Failed to write blurred image to %s\n", fileName.c_str());
+            }
+        }
+
+        printf("Saved blurred image in file '%s'\n", fileName.c_str());
 
         // Keep the displays open
         std::getchar();
@@ -147,8 +166,8 @@ int main(int argCount, char* argValues[])
 void initConfig(Configuration& config, int argCount, char* argValues[])
 {
     // Initialize default values
-    config.program = CPU;
-    config.threadCount = 69632;
+    config.program = CUDA;
+    config.threadCount = 4096;
     config.quick = false;
 
     for (int argIdx = 1; argIdx < argCount; argIdx += 1) {
@@ -186,6 +205,40 @@ void initConfig(Configuration& config, int argCount, char* argValues[])
                 break;
         }
     }
+}
+
+void loadPPM(const std::string& fileName, CImg<unsigned char>& image)
+{
+    std::ifstream file(fileName.c_str(), std::ios::in | std::ios::binary);
+    if (!file) {
+        printf("Failed to open file: %s\n", fileName.c_str());
+        return;
+    }
+
+    // Ignore magic string
+    std::string input = "";
+    file >> input;
+
+    // Read dimensions
+    int width = 0, height = 0;
+    file >> width;
+    file >> height;
+
+    image = CImg<unsigned char>(width, height, 1, 3);
+
+    // Ignore number/comment
+    file >> input;
+    file.ignore();
+
+    // Read image data
+    unsigned char* imageData = image.data();
+    std::streamsize bytesPerRow = width * 3;
+
+    for (int i = 0; i < height * width * 3; i += 1) {
+        imageData[i] = file.get();
+    }
+
+    file.close();
 }
 
 void initMask(CImg<double>& mask, bool quick)

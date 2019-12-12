@@ -47,33 +47,18 @@ __global__ void gaussianBlurKernel(unsigned char* imageIn, unsigned char* imageO
 
     int pixelCount = imageDims.x * imageDims.y;
 
-    // Blur all channels
+    // Blur all channels in each pixel
     for (int pixelIdx = tid; pixelIdx < pixelCount; pixelIdx += threadCount) {
         int yPos = pixelIdx / imageDims.x;
         int xPos = pixelIdx - yPos * imageDims.x;
 
-        // Find borders in X and Y directions, in case the pixel is near the edge of the image
-        int xMin = max(0, xPos - 2);
-        int xMax = min(imageDims.x-1, xPos + 2);
-
-        int yMin = max(0, yPos - 2);
-        int yMax = min(imageDims.y-1, yPos + 2);
-
-        int yLength = yMax - yMin + 1;
-        int xLength = xMax - xMin + 1;
-
-        // Offset the mask index using the x and y borders
-        int maskOffsetX = (xMin - xPos + 2);
-        int maskOffsetY = (yMin - yPos + 2);
-        int maskStartIdx = 5 * maskOffsetY + maskOffsetX;
-
         double red = 0.0, green = 0.0, blue = 0.0;
-
-        for (int yOffset = 0; yOffset < yLength; yOffset += 1) {
-            int imageIdxRed = (yMin + yOffset) * imageDims.x + xMin;
-            int maskIdx = maskStartIdx + 5 * yOffset;
-
-            for (int xOffset = 0; xOffset < xLength; xOffset += 1) {
+        int maskIdx = 0;
+        for (int yOffset = -2; yOffset < 3; yOffset++) {
+            int y = min(imageDims.y-1, max(0, yPos + yOffset));
+            for (int xOffset = -2; xOffset < 3; xOffset++) {
+                int x = min(imageDims.x-1, max(0, xPos + xOffset));
+                int imageIdxRed = y * imageDims.x + x;
                 double maskValue = mask[maskIdx++];
                 red += imageIn[imageIdxRed] * maskValue;
                 green += imageIn[imageIdxRed + pixelCount] * maskValue;
@@ -110,12 +95,13 @@ int main(int argCount, char* argValues[])
     Configuration config;
     initConfig(config, argCount, argValues);
 
-    CImg<unsigned char> image("cake.ppm"), blurimage;
+    CImg<unsigned char> image, blurimage;
     CImg<double> mask;
     initMask(mask, config.quick);
 
     printf("Starting blurring process\n");
     if (config.program == CPU) {
+        blurimage.load("cake.ppm");
         blurimage.convolve(mask);
     } else {
         loadPPM("cake.ppm", blurimage);
@@ -134,22 +120,28 @@ int main(int argCount, char* argValues[])
 
     if (!config.quick) {
         // Display images and save the blurred version
+        image.load("cake.ppm");
         CImgDisplay main_disp(image, "Original image");
+        CImgDisplay main_disp2;
         // The CUDA program converts the data layout format to RGBRGB, which CImg isn't meant to display
         if (config.program == CPU) {
-            CImgDisplay main_disp2(blurimage, "Blurred image");
+            main_disp2.set_title("Blurred image");
+            main_disp2.display(blurimage);
+            main_disp2.paint();
+            main_disp2.show();
         }
 
         // Save image to file
         std::string fileName = "blurred.";
-
-        if (config.program == CPU) {
+            if (config.program == CPU) {
             fileName.append("ppm");
             blurimage.save(fileName.c_str());
         } else {
             fileName.append("jpeg");
+            jpge::params jpegParams;
+            jpegParams.m_quality = 100;
 
-            if (!jpge::compress_image_to_jpeg_file(fileName.c_str(), blurimage.width(), blurimage.height(), blurimage.spectrum(), blurimage.data())) {
+            if (!jpge::compress_image_to_jpeg_file(fileName.c_str(), blurimage.width(), blurimage.height(), blurimage.spectrum(), blurimage.data(), jpegParams)) {
                 printf("Failed to write blurred image to %s\n", fileName.c_str());
             }
         }

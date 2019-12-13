@@ -59,10 +59,12 @@ __global__ void gaussianBlurKernel(unsigned char* imageIn, unsigned char* imageO
             for (int xOffset = -2; xOffset < 3; xOffset++) {
                 int x = min(imageDims.x-1, max(0, xPos + xOffset));
                 int imageIdxRed = y * imageDims.x + x;
+
                 double maskValue = mask[maskIdx++];
                 red += imageIn[imageIdxRed] * maskValue;
                 green += imageIn[imageIdxRed + pixelCount] * maskValue;
                 blue += imageIn[imageIdxRed + pixelCount + pixelCount] * maskValue;
+
                 imageIdxRed += 1;
             }
         }
@@ -89,6 +91,7 @@ void initConfig(Configuration& config, int argCount, char* argValues[]);
 void loadPPM(const std::string& fileName, CImg<unsigned char>& image);
 void initMask(CImg<double>& mask, bool quick);
 cudaError_t cudaGaussianBlur(CImg<unsigned char>& image, const CImg<double>& mask, const Configuration& config);
+bool checkValidity(const CImg<unsigned char>& cImage, const CImg<unsigned char>& cudaImage);
 
 int main(int argCount, char* argValues[])
 {
@@ -123,12 +126,17 @@ int main(int argCount, char* argValues[])
         image.load("cake.ppm");
         CImgDisplay main_disp(image, "Original image");
         CImgDisplay main_disp2;
+
         // The CUDA program converts the data layout format to RGBRGB, which CImg isn't meant to display
         if (config.program == CPU) {
+            // Display image blurred on the CPU
             main_disp2.set_title("Blurred image");
             main_disp2.display(blurimage);
             main_disp2.paint();
             main_disp2.show();
+        } else {
+            // Check if the CUDA blurring is equivalent to the CImg blurring
+            checkValidity(image, blurimage);
         }
 
         // Save image to file
@@ -478,4 +486,41 @@ void printMatrix(const std::vector<float>& matrix, const std::vector<float>& vec
     }
 
     fileOut.close();
+}
+
+bool checkValidity(const CImg<unsigned char>& cImage, const CImg<unsigned char>& cudaImage)
+{
+    int pixelCount = cImage.height() * cImage.width();
+
+    const unsigned char* cimgData = cImage.data();
+    const unsigned char* cudaData = cudaImage.data();
+
+    for (int pixel = 0; pixel < pixelCount; pixel++) {
+        unsigned char cimgRed = cimgData[pixel];
+        unsigned char cimgGreen = cimgData[pixel + pixelCount];
+        unsigned char cimgBlue = cimgData[pixel + pixelCount + pixelCount];
+
+        unsigned char cudaRed = cudaData[pixel * 3];
+        unsigned char cudaGreen = cudaData[pixel * 3 + 1];
+        unsigned char cudaBlue = cudaData[pixel * 3 + 2];
+
+        int pixY = pixel / cImage.width();
+        int pixX = pixel - pixY * cImage.width();
+
+        if (cimgRed != cudaRed) {
+            printf("Red colors don't match at pixel (%d,%d): cimg: %d, cuda: %d\n", pixX, pixY, cimgRed, cudaRed);
+            //return false;
+        }
+        if (cimgGreen != cudaGreen) {
+            printf("Green colors don't match at pixel (%d,%d): cimg: %d, cuda: %d\n", pixX, pixY, cimgGreen, cudaGreen);
+            //return false;
+        }
+        if (cimgBlue != cudaBlue) {
+            printf("Blue colors don't match at pixel (%d,%d): cimg: %d, cuda: %d\n", pixX, pixY, cimgBlue, cudaBlue);
+            //return false;
+        }
+    }
+
+    printf("The blurring in CUDA was done the same was as in CImg\n");
+    return true;
 }

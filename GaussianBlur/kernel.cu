@@ -63,9 +63,7 @@ __global__ void gaussianBlurKernel(unsigned char* imageIn, unsigned char* imageO
                 double maskValue = mask[maskIdx++];
                 red += imageIn[imageIdxRed] * maskValue;
                 green += imageIn[imageIdxRed + pixelCount] * maskValue;
-                blue += imageIn[imageIdxRed + pixelCount + pixelCount] * maskValue;
-
-                imageIdxRed += 1;
+                blue += imageIn[imageIdxRed + pixelCount * 2] * maskValue;
             }
         }
 
@@ -136,12 +134,13 @@ int main(int argCount, char* argValues[])
             main_disp2.show();
         } else {
             // Check if the CUDA blurring is equivalent to the CImg blurring
+            image.convolve(mask);
             checkValidity(image, blurimage);
         }
 
         // Save image to file
         std::string fileName = "blurred.";
-            if (config.program == CPU) {
+        if (config.program == CPU) {
             fileName.append("ppm");
             blurimage.save(fileName.c_str());
         } else {
@@ -154,7 +153,7 @@ int main(int argCount, char* argValues[])
             }
         }
 
-        printf("Saved blurred image in file '%s'\n", fileName.c_str());
+        printf("Saved blurred image to file '%s'\n", fileName.c_str());
 
         // Keep the displays open
         std::getchar();
@@ -232,13 +231,10 @@ void loadPPM(const std::string& fileName, CImg<unsigned char>& image)
 
     // Read image data
     unsigned char* imageData = image.data();
-    std::streamsize bytesPerRow = width * 3;
+    std::streamsize dataSize = width * height * 3;
 
-    const std::streamsize chunkSize = 8192;
-
-    while (file) {
-        file.read((char*)imageData, chunkSize);
-        imageData += chunkSize;
+    if (!file.read((char*)imageData, dataSize)) {
+        printf("Failed to load image: read returned an error\n");
     }
 
     file.close();
@@ -296,7 +292,7 @@ cudaError_t cudaGaussianBlur(CImg<unsigned char>& image, const CImg<double>& mas
     }
 
     // Send image dimensions vector to GPU.
-    int2 imageDimensions[2] = {image.width(), image.height()};
+    int imageDimensions[2] = {image.width(), image.height()};
     cudaStatus = cudaMemcpyToSymbol(imageDims, (void*)imageDimensions, sizeof(int) * 2);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpyToSymbol failed: %s\n", cudaGetErrorString(cudaStatus));
@@ -353,7 +349,7 @@ cudaError_t cudaGaussianBlur(CImg<unsigned char>& image, const CImg<double>& mas
 
     /* Prepare to blur the image */
     // Allocate GPU buffer for mask.
-    cudaStatus = cudaMalloc((void**)&deviceMask, mask.size() * mask.size() * sizeof(double));
+    cudaStatus = cudaMalloc((void**)&deviceMask, mask.size() * sizeof(double));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed: %s\n", cudaGetErrorString(cudaStatus));
         goto Error;
@@ -509,18 +505,18 @@ bool checkValidity(const CImg<unsigned char>& cImage, const CImg<unsigned char>&
 
         if (cimgRed != cudaRed) {
             printf("Red colors don't match at pixel (%d,%d): cimg: %d, cuda: %d\n", pixX, pixY, cimgRed, cudaRed);
-            //return false;
+            return false;
         }
         if (cimgGreen != cudaGreen) {
             printf("Green colors don't match at pixel (%d,%d): cimg: %d, cuda: %d\n", pixX, pixY, cimgGreen, cudaGreen);
-            //return false;
+            return false;
         }
         if (cimgBlue != cudaBlue) {
             printf("Blue colors don't match at pixel (%d,%d): cimg: %d, cuda: %d\n", pixX, pixY, cimgBlue, cudaBlue);
-            //return false;
+            return false;
         }
     }
 
-    printf("The blurring in CUDA was done the same was as in CImg\n");
+    printf("The blurring in CUDA was done the same way as in CImg\n");
     return true;
 }
